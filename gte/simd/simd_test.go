@@ -1,8 +1,11 @@
 package simd
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
+	"sync"
 	"testing"
 	"unsafe"
 )
@@ -122,7 +125,6 @@ func TestSaxpyAligned(t *testing.T) {
 		}
 	}
 }
-
 
 func naiveSgemmNT(m, n, k int, alpha float32, a []float32, lda int, b []float32, ldb int, c []float32, ldc int) {
 	for i := 0; i < m; i++ {
@@ -646,6 +648,134 @@ func TestSgemmNTGebpWithPrefilledC(t *testing.T) {
 	}
 }
 
+// gebpDiffCase fills A, B and C with random data at the given strides, runs
+// SgemmNTGebp, and compares against a float64 triple loop. Stride gaps in A and
+// B hold NaN, so a read of a gap poisons the result; stride gaps in C hold a
+// sentinel, so a write to a gap is seen.
+func gebpDiffCase(t *testing.T, rng *rand.Rand, m, n, k, lda, ldb, ldc int, alpha float32) {
+	t.Helper()
+	nan := float32(math.NaN())
+	const sentinel = float32(-12345.5)
+	fill := func(rows, cols, ld int, gap float32) []float32 {
+		s := make([]float32, rows*ld)
+		for i := range s {
+			s[i] = gap
+		}
+		for i := 0; i < rows; i++ {
+			for j := 0; j < cols; j++ {
+				s[i*ld+j] = rng.Float32()*2 - 1
+			}
+		}
+		return s
+	}
+	a := fill(m, k, lda, nan)
+	b := fill(n, k, ldb, nan)
+	c := fill(m, n, ldc, sentinel)
+	before := append([]float32(nil), c...)
+
+	SgemmNTGebp(m, n, k, alpha, unsafe.Pointer(&a[0]), unsafe.Pointer(&b[0]), unsafe.Pointer(&c[0]), lda, ldb, ldc)
+
+	// Forward error bound for a k-term float32 inner product and one addition.
+	const eps = 1.0 / (1 << 23)
+	for i := 0; i < m; i++ {
+		for j := 0; j < ldc; j++ {
+			got := c[i*ldc+j]
+			if j >= n {
+				if got != sentinel {
+					t.Fatalf("m=%d n=%d k=%d lda=%d ldb=%d ldc=%d: C[%d,%d] gap overwritten: %v", m, n, k, lda, ldb, ldc, i, j, got)
+				}
+				continue
+			}
+			sum, mag := 0.0, 0.0
+			for p := 0; p < k; p++ {
+				x := float64(a[i*lda+p]) * float64(b[j*ldb+p])
+				sum += x
+				mag += math.Abs(x)
+			}
+			c0 := float64(before[i*ldc+j])
+			want := c0 + float64(alpha)*sum
+			tol := float64(k+2) * eps * (math.Abs(float64(alpha))*mag + math.Abs(c0))
+			if diff := math.Abs(float64(got) - want); !(diff <= tol) {
+				t.Fatalf("m=%d n=%d k=%d lda=%d ldb=%d ldc=%d alpha=%v: C[%d,%d]=%v, want %v (diff %g > tol %g)",
+					m, n, k, lda, ldb, ldc, alpha, i, j, got, want, diff, tol)
+			}
+		}
+	}
+}
+
+// TestSgemmNTGebpDifferential covers tile edges: m and n on either side of the
+// MR and NR multiples, small and large k, strides wider than the data, nonzero C.
+func TestSgemmNTGebpDifferential(t *testing.T) {
+	if !HasSgemmAsm {
+		t.Skip("no SGEMM assembly")
+	}
+	rng := rand.New(rand.NewSource(7))
+	alphas := []float32{1, 0.125, -2.5}
+	strides := []struct{ da, db, dc int }{{0, 0, 0}, {3, 0, 0}, {0, 5, 0}, {0, 0, 7}, {1, 2, 3}}
+	turn := 0
+	for _, k := range []int{1, 2, 3, 7, 8, 16, 17, 32, 64, 384, 1536} {
+		for _, m := range []int{1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 32, 37} {
+			for _, n := range []int{1, 7, 8, 15, 16, 17, 31, 32, 33, 48, 100} {
+				for _, s := range strides {
+					alpha := alphas[turn%len(alphas)]
+					turn++
+					gebpDiffCase(t, rng, m, n, k, k+s.da, k+s.db, n+s.dc, alpha)
+				}
+			}
+		}
+	}
+}
+
+// TestSgemmNTGebpConcurrent runs independent multiplies at once, the way the
+// attention heads call it from their own goroutines. Each call has its own A, B
+// and C, so each result must match its naive product whatever else is running.
+func TestSgemmNTGebpConcurrent(t *testing.T) {
+	if !HasSgemmAsm {
+		t.Skip("no SGEMM assembly")
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(8))
+	shapes := []struct{ m, n, k int }{
+		{64, 64, 32}, // one attention head, 64 tokens
+		{64, 64, 32},
+		{64, 64, 32},
+		{64, 64, 32},
+		{33, 48, 64},    // a different k changes the panel size
+		{40, 1152, 384}, // QKV projection
+		{13, 384, 1536}, // FFN down
+		{64, 64, 32},
+	}
+	const rounds = 8
+	var wg sync.WaitGroup
+	errs := make(chan string, len(shapes)*rounds)
+	for w, sh := range shapes {
+		wg.Add(1)
+		go func(w, m, n, k int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w) + 1))
+			a := randMatrix(rng, m, k)
+			b := randMatrix(rng, n, k)
+			ref := make([]float32, m*n)
+			naiveSgemmNT(m, n, k, 1, a, k, b, k, ref, n)
+			got := make([]float32, m*n)
+			for r := 0; r < rounds; r++ {
+				clear(got)
+				SgemmNTGebp(m, n, k, 1, unsafe.Pointer(&a[0]), unsafe.Pointer(&b[0]), unsafe.Pointer(&got[0]), k, k, n)
+				for i := range got {
+					if absErr(got[i], ref[i]) > 1e-2 {
+						errs <- fmt.Sprintf("worker %d (m=%d n=%d k=%d) round %d: C[%d]=%v, want %v", w, m, n, k, r, i, got[i], ref[i])
+						return
+					}
+				}
+			}
+		}(w, sh.m, sh.n, sh.k)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
 // --- packBNT tests ---
 
 func TestPackBNT(t *testing.T) {
@@ -742,7 +872,10 @@ func TestSgemmNTBlockedFMAGTESizes(t *testing.T) {
 	if !HasSgemmAsm {
 		t.Skip("no assembly")
 	}
-	sizes := []struct{ m, n, k int; name string }{
+	sizes := []struct {
+		m, n, k int
+		name    string
+	}{
 		{7, 1152, 384, "QKV fused"},
 		{7, 384, 384, "attn output"},
 		{7, 1536, 384, "FFN up"},

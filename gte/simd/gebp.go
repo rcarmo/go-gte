@@ -1,18 +1,23 @@
 package simd
 
 import (
+	"sync"
 	"unsafe"
 )
 
 const gebpNR = 16
 
-var gebpBuf []float32
+// gebpBufPool holds packing buffers. Each call needs its own: the attention
+// heads and the EmbedBatchParallel workers call SgemmNTGebp concurrently.
+var gebpBufPool = sync.Pool{New: func() any { return new([]float32) }}
 
-func ensureGebpBuf(size int) []float32 {
-	if cap(gebpBuf) < size {
-		gebpBuf = make([]float32, size)
+func getGebpBuf(size int) *[]float32 {
+	buf := gebpBufPool.Get().(*[]float32)
+	if cap(*buf) < size {
+		*buf = make([]float32, size)
 	}
-	return gebpBuf[:size]
+	*buf = (*buf)[:size]
+	return buf
 }
 
 func packBNT(b []float32, ldb, jj, nr, k int, bp []float32) {
@@ -85,7 +90,9 @@ func SgemmNTGebp(m, n, k int, alpha float32, aPtr, bPtr, cPtr unsafe.Pointer, ld
 	a := unsafe.Slice((*float32)(aPtr), m*lda)
 	b := unsafe.Slice((*float32)(bPtr), n*ldb)
 	c := unsafe.Slice((*float32)(cPtr), m*ldc)
-	bp := ensureGebpBuf(k * gebpNR)
+	buf := getGebpBuf(k * gebpNR)
+	defer gebpBufPool.Put(buf)
+	bp := *buf
 
 	for jj := 0; jj < n; jj += gebpNR {
 		nr := gebpNR
