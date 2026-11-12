@@ -2,6 +2,8 @@ package gte
 
 import (
 	"math"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -125,6 +127,36 @@ func TestEmbedBatch(t *testing.T) {
 	sim, _ := CosineSimilarity(embeddings[0], single)
 	if sim < 0.999 {
 		t.Errorf("batch vs single: sim=%v, want ~1.0", sim)
+	}
+}
+
+// TestEmbedLongTextParallelHeads embeds a text long enough for selfAttention to
+// run its heads in goroutines. The result must not depend on how many of them
+// run at once.
+func TestEmbedLongTextParallelHeads(t *testing.T) {
+	model := loadTestModel(t)
+	text := strings.Repeat("the quick brown fox jumps over the lazy dog near the riverbank ", 20)
+
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	serial, err := model.Embed(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial = append([]float32(nil), serial...)
+
+	runtime.GOMAXPROCS(8)
+	for i := 0; i < 3; i++ {
+		parallel, err := model.Embed(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sim, err := CosineSimilarity(serial, parallel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sim < 0.9999 {
+			t.Errorf("run %d: sim=%v between 1 and 8 GOMAXPROCS, want ~1.0", i, sim)
+		}
 	}
 }
 
